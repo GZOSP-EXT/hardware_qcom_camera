@@ -672,13 +672,7 @@ QCamera3HardwareInterface::~QCamera3HardwareInterface()
     {
         std::unique_lock<std::mutex> l(gHdrPlusClientLock);
         finishHdrPlusClientOpeningLocked(l);
-        if (gHdrPlusClient != nullptr) {
-            // Disable HDR+ mode.
-            disableHdrPlusModeLocked();
-            // Disconnect Easel if it's connected.
-            gEaselManagerClient->closeHdrPlusClient(std::move(gHdrPlusClient));
-            gHdrPlusClient = nullptr;
-        }
+        closeHdrPlusClientLocked();
     }
 
     // unlink of dualcam during close camera
@@ -5300,6 +5294,18 @@ int QCamera3HardwareInterface::processCaptureRequest(
     bool isVidBufRequested = false;
     camera3_stream_buffer_t *pInputBuffer = NULL;
 
+    // If Easel is thermal throttled and there is no pending HDR+ request,
+    // close HDR+ client.
+    {
+        std::unique_lock<std::mutex> l(gHdrPlusClientLock);
+        if (gHdrPlusClient != nullptr && mEaselThermalThrottled) {
+            Mutex::Autolock lock(mHdrPlusPendingRequestsLock);
+            if (mHdrPlusPendingRequests.empty()) {
+                closeHdrPlusClientLocked();
+            }
+        }
+    }
+
     pthread_mutex_lock(&mMutex);
 
     // Validate current state
@@ -5855,7 +5861,6 @@ no_error:
     // Mark current timestamp for the new request
     bufsForCurRequest.timestamp = systemTime(CLOCK_MONOTONIC);
     bufsForCurRequest.av_timestamp = 0;
-    bufsForCurRequest.hdrplus = hdrPlusRequest;
 
     if (hdrPlusRequest) {
         // Save settings for this request.
@@ -15136,7 +15141,8 @@ int32_t QCamera3HardwareInterface::notifyErrorForPendingRequests()
     while (pendingRequest != mPendingRequestsList.end() ||
            pendingBuffer != mPendingBuffersMap.mPendingBuffersInRequest.end()) {
         if (pendingRequest == mPendingRequestsList.end() ||
-            pendingBuffer->frame_number < pendingRequest->frame_number) {
+                ((pendingBuffer != mPendingBuffersMap.mPendingBuffersInRequest.end()) &&
+                 (pendingBuffer->frame_number < pendingRequest->frame_number))) {
             // If metadata for this frame was sent, notify about a buffer error and returns buffers
             // with error.
             for (auto &info : pendingBuffer->mPendingBufferList) {
@@ -15160,7 +15166,8 @@ int32_t QCamera3HardwareInterface::notifyErrorForPendingRequests()
 
             pendingBuffer = mPendingBuffersMap.mPendingBuffersInRequest.erase(pendingBuffer);
         } else if (pendingBuffer == mPendingBuffersMap.mPendingBuffersInRequest.end() ||
-                   pendingBuffer->frame_number > pendingRequest->frame_number) {
+                   ((pendingRequest != mPendingRequestsList.end()) &&
+                   (pendingBuffer->frame_number > pendingRequest->frame_number))) {
             // If the buffers for this frame were sent already, notify about a result error.
             camera3_notify_msg_t notify_msg;
             memset(&notify_msg, 0, sizeof(camera3_notify_msg_t));
@@ -16144,6 +16151,25 @@ void QCamera3HardwareInterface::onEaselFatalError(std::string errMsg)
     handleEaselFatalErrorAsync();
 }
 
+void QCamera3HardwareInterface::closeHdrPlusClientLocked()
+{
+    if (gHdrPlusClient != nullptr) {
+        // Disable HDR+ mode.
+        disableHdrPlusModeLocked();
+        // Disconnect Easel if it's connected.
+        gEaselManagerClient->closeHdrPlusClient(std::move(gHdrPlusClient));
+        gHdrPlusClient = nullptr;
+        ALOGD("HDR+ client closed.");
+    }
+}
+
+void QCamera3HardwareInterface::onThermalThrottle() {
+    ALOGW("%s: Thermal throttling. Will close HDR+ client.", __FUNCTION__);
+    // HDR+ will be disabled when HAL receives the next request and there is no
+    // pending HDR+ request.
+    mEaselThermalThrottled = true;
+}
+
 void QCamera3HardwareInterface::onOpened(std::unique_ptr<HdrPlusClient> client)
 {
     int rc = NO_ERROR;
@@ -16414,10 +16440,29 @@ void QCamera3HardwareInterface::onCaptureResult(pbcamera::CaptureResult *result,
         }
 
         if (channel == mPictureChannel) {
+            android_errorWriteLog(0x534e4554, "150004253");
+            // Keep a copy of outputBufferDef until the final JPEG buffer is
+            // ready because the JPEG callback uses the mm_camera_buf_def_t
+            // struct. The metaBufDef is stored in a shared_ptr to make sure
+            // it's freed.
+            std::shared_ptr<mm_camera_buf_def_t> metaBufDef =
+                    std::make_shared<mm_camera_buf_def_t>();
+            {
+                pthread_mutex_lock(&mMutex);
+                for (auto& pendingBuffers : mPendingBuffersMap.mPendingBuffersInRequest) {
+                    if (pendingBuffers.frame_number == result->requestId) {
+                        pendingBuffers.mHdrplusInputBuf = outputBufferDef;
+                        pendingBuffers.mHdrplusInputMetaBuf = metaBufDef;
+                        break;
+                    }
+                }
+                pthread_mutex_unlock(&mMutex);
+            }
+
             // Return the buffer to pic channel for encoding.
             mPictureChannel->returnYuvBufferAndEncode(outputBufferDef.get(),
                     frameworkOutputBuffer->buffer, result->requestId,
-                    halMetadata);
+                    halMetadata, metaBufDef.get());
         } else {
             // Return the buffer to camera framework.
             pthread_mutex_lock(&mMutex);
